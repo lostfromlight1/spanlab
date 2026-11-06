@@ -1,0 +1,55 @@
+# Order service. HTTP is 8081 and is not published to the host.
+# The gateway reaches it as http://order-service:8081.
+# ddl-auto is none because Flyway owns the schema.
+# globally_quoted_identifiers quotes "order", which is a SQL keyword.
+# The catalog channel name matches @ImportGrpcClients(target = "catalog").
+# Traces go to Jaeger. OTLP metrics are off; Prometheus scrapes /actuator/prometheus.
+server:
+  port: 8081
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:postgresql://postgres:5432/spanlab
+    username: spanlab
+    password: spanlab
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate.globally_quoted_identifiers: true
+  kafka:
+    bootstrap-servers: kafka:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+  grpc:
+    client:
+      channel:
+        catalog:
+          target: static://catalog-service:9090
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    metrics:
+      export:
+        enabled: false
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: http://jaeger:4318/v1/traces
