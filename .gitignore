@@ -1,0 +1,15 @@
+.gradle/
+build/
+bin/
+*.class
+*.jar
+.idea/
+*.iml
+.vscode/
+.cursor/
+.DS_Store
+Thumbs.db
+*.exe
+*.test
+consumer/consumer
+gateway/gateway
