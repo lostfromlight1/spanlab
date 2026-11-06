@@ -1,0 +1,22 @@
+// Catalog.CheckSku. Gradle generates Java in com.spanlab.catalog.v1
+// for both the catalog server and the order-service client.
+// known is false for anything other than SKU-1 and SKU-2. The order
+// service maps that to HTTP 400. This file does not define an error.
+syntax = "proto3";
+
+package spanlab.catalog.v1;
+
+option java_package = "com.spanlab.catalog.v1";
+option java_multiple_files = true;
+
+service Catalog {
+  rpc CheckSku (CheckSkuRequest) returns (CheckSkuResponse);
+}
+
+message CheckSkuRequest {
+  string sku = 1;
+}
+
+message CheckSkuResponse {
+  bool known = 1;
+}
