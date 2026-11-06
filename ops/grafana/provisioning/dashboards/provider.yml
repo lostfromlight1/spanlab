@@ -1,0 +1,9 @@
+# Loads every dashboard JSON in this directory. spanlab.json is the
+# HTTP request-rate board at /d/spanlab/spanlab.
+apiVersion: 1
+
+providers:
+  - name: spanlab
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards

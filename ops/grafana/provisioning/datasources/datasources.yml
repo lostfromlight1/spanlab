@@ -1,0 +1,17 @@
+# Grafana datasources. Prometheus is the default for the dashboard.
+# Jaeger is available when you want to open a trace from Grafana.
+# Both URLs are inside the Docker network, not localhost.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686

@@ -1,0 +1,195 @@
+# The lab as processes on one machine. Learning guide:
+# learning/concepts/compose-and-kubernetes.md
+#
+# Published ports are gateway 8080, Jaeger 16686, and Grafana 3000.
+# Health checks for the apps are HTTP GETs sent with Bash, because
+# the images do not have curl. See ops/http-health.sh.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: spanlab
+      POSTGRES_USER: spanlab
+      POSTGRES_PASSWORD: spanlab
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spanlab -d spanlab"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:4.2.2
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  # Creates both topics before the consumer joins the group.
+  # A one-shot shell, because the image entrypoint runs a single command.
+  kafka-init:
+    image: apache/kafka:4.2.2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic order-events --partitions 1 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic order-events-dlq --partitions 1 --replication-factor 1
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    ports:
+      - "16686:16686"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      order-service:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: spanlab
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - jaeger
+
+  catalog-service:
+    image: spanlab/catalog-service:local
+    build:
+      context: .
+      dockerfile: catalog-service/Dockerfile
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/http-health.sh", "8083", "/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  order-service:
+    image: spanlab/order-service:local
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/spanlab
+      SPRING_DATASOURCE_USERNAME: spanlab
+      SPRING_DATASOURCE_PASSWORD: spanlab
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      catalog-service:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/http-health.sh", "8081", "/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  consumer:
+    image: spanlab/consumer:local
+    build:
+      context: .
+      dockerfile: consumer/Dockerfile
+    environment:
+      DATABASE_URL: postgres://spanlab:spanlab@postgres:5432/spanlab
+      KAFKA_BROKERS: kafka:9092
+      OTEL_SERVICE_NAME: consumer
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/http-health.sh", "8082", "/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  gateway:
+    image: spanlab/gateway:local
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      ORDER_URL: http://order-service:8081
+      CONSUMER_URL: http://consumer:8082
+      OTEL_SERVICE_NAME: gateway
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+    depends_on:
+      order-service:
+        condition: service_healthy
+      consumer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/http-health.sh", "8080", "/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Not started by docker compose up. Run:
+  #   docker compose --profile load run --rm loadgen
+  loadgen:
+    profiles: ["load"]
+    image: spanlab/loadgen:local
+    build:
+      context: .
+      dockerfile: loadgen/Dockerfile
+    environment:
+      GATEWAY_URL: http://gateway:8080
+      COUNT: "10"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: "no"

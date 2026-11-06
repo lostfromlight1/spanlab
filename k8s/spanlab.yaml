@@ -1,0 +1,463 @@
+# Same lab as docker-compose.yml, written as Kubernetes objects.
+# Namespace spanlab. This file has not been applied on a cluster.
+# Learning guide: learning/concepts/compose-and-kubernetes.md
+#
+# A Service named kafka is the DNS name the broker advertises.
+# kafka-init is a Job. Readiness probes are HTTP, so the Bash
+# health script from Compose is not used here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spanlab
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: spanlab
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              value: spanlab
+            - name: POSTGRES_USER
+              value: spanlab
+            - name: POSTGRES_PASSWORD
+              value: spanlab
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "spanlab", "-d", "spanlab"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: spanlab
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: plain
+      port: 9092
+    - name: controller
+      port: 9093
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      # Must match the Service name. The broker advertises kafka:9092.
+      hostname: kafka
+      containers:
+        - name: kafka
+          image: apache/kafka:4.2.2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: broker,controller
+            - name: KAFKA_LISTENERS
+              value: PLAINTEXT://:9092,CONTROLLER://:9093
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: PLAINTEXT://kafka:9092
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: 1@kafka:9093
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: PLAINTEXT
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_NUM_PARTITIONS
+              value: "1"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "true"
+            - name: KAFKA_CLUSTER_ID
+              value: MkU3OEVBNTcwNTJENDM2Qk
+---
+# Runs once, creates order-events and order-events-dlq, then finishes.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-init
+  namespace: spanlab
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: kafka-init
+          image: apache/kafka:4.2.2
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic order-events --partitions 1 --replication-factor 1
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic order-events-dlq --partitions 1 --replication-factor 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: spanlab
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: ui
+      port: 16686
+    - name: otlp
+      port: 4318
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.76.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 16686
+            - containerPort: 4318
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus
+  namespace: spanlab
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+      - job_name: order-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ["order-service:8081"]
+      - job_name: catalog-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ["catalog-service:8083"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: spanlab
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.2.1
+          imagePullPolicy: IfNotPresent
+          args: ["--config.file=/etc/prometheus/prometheus.yml"]
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: spanlab
+spec:
+  selector:
+    app: grafana
+  ports:
+    - port: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.6.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: spanlab
+          ports:
+            - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-service
+  namespace: spanlab
+spec:
+  selector:
+    app: catalog-service
+  ports:
+    - name: http
+      port: 8083
+    - name: grpc
+      port: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-service
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catalog-service
+  template:
+    metadata:
+      labels:
+        app: catalog-service
+    spec:
+      containers:
+        - name: catalog-service
+          image: spanlab/catalog-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8083
+            - containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8083
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: spanlab
+spec:
+  selector:
+    app: order-service
+  ports:
+    - port: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+        - name: order-service
+          image: spanlab/order-service:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://postgres:5432/spanlab
+            - name: SPRING_DATASOURCE_USERNAME
+              value: spanlab
+            - name: SPRING_DATASOURCE_PASSWORD
+              value: spanlab
+            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:9092
+          ports:
+            - containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8081
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: consumer
+  namespace: spanlab
+spec:
+  selector:
+    app: consumer
+  ports:
+    - port: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: consumer
+  template:
+    metadata:
+      labels:
+        app: consumer
+    spec:
+      containers:
+        - name: consumer
+          image: spanlab/consumer:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DATABASE_URL
+              value: postgres://spanlab:spanlab@postgres:5432/spanlab
+            - name: KAFKA_BROKERS
+              value: kafka:9092
+            - name: OTEL_SERVICE_NAME
+              value: consumer
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://jaeger:4318/v1/traces
+          ports:
+            - containerPort: 8082
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8082
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: spanlab
+spec:
+  selector:
+    app: gateway
+  ports:
+    - port: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: spanlab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: spanlab/gateway:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ORDER_URL
+              value: http://order-service:8081
+            - name: CONSUMER_URL
+              value: http://consumer:8082
+            - name: OTEL_SERVICE_NAME
+              value: gateway
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://jaeger:4318/v1/traces
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
